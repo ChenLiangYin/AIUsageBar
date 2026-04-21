@@ -4,6 +4,10 @@ A Mac menu bar app that shows real **Claude Code** and **Codex** rate-limit
 utilization at a glance. Pure Swift + AppKit + SwiftUI. macOS 13 Ventura or
 later, Apple Silicon.
 
+<p align="center">
+  <img src="docs/screenshot.png" width="420" alt="AIUsageBar popup showing Claude Code 5h session, 7-day usage, and Codex window utilization">
+</p>
+
 ## Install
 
 ```bash
