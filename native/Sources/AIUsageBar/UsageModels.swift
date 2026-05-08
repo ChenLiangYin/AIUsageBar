@@ -14,6 +14,7 @@ struct UsageBar: Equatable {
 
 enum ProviderStatus: String, Equatable {
     case ok
+    case stale
     case error
     case unavailable
 }

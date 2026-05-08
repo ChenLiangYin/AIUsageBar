@@ -73,21 +73,6 @@ private struct TitleBar: View {
             }
             .buttonStyle(.borderless)
             .opacity(store.refreshing ? 0.5 : 1)
-            Button {
-                // Close the popover (not quit). To quit, right-click the
-                // menu-bar icon → Quit AIUsageBar.
-                for window in NSApp.windows where window.className.contains("Popover") {
-                    window.orderOut(nil)
-                }
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.5))
-                    .frame(width: 22, height: 22)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.borderless)
-            .help("Close popup — right-click menu bar icon to quit")
         }
         .padding(.horizontal, 12)
         .padding(.top, 12)
@@ -117,7 +102,7 @@ private struct ProviderCard: View {
             }
             .padding(.bottom, 10)
 
-            if provider.status == .ok {
+            if provider.status == .ok || provider.status == .stale {
                 VStack(alignment: .leading, spacing: 10) {
                     ForEach(provider.bars, id: \.label) { bar in
                         BarView(bar: bar, accent: accent)
@@ -160,6 +145,8 @@ private struct StatusChip: View {
             switch status {
             case .ok:
                 return (Color.green.opacity(0.15), Color(red: 0.5, green: 0.9, blue: 0.6), "live")
+            case .stale:
+                return (Color.yellow.opacity(0.16), Color(red: 0.95, green: 0.78, blue: 0.35), "cached")
             case .error:
                 return (Color.red.opacity(0.15), Color(red: 0.95, green: 0.5, blue: 0.5), "error")
             case .unavailable:
@@ -181,30 +168,32 @@ private struct BarView: View {
     let accent: Color
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(bar.label)
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.55))
-                if let reset = bar.resetsAt {
-                    Text("· resets \(formatReset(reset))")
-                        .font(.system(size: 10))
-                        .foregroundColor(.white.opacity(0.35))
+        TimelineView(.periodic(from: Date(), by: 30)) { timeline in
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(bar.label)
+                        .font(.system(size: 11))
+                        .foregroundColor(.white.opacity(0.55))
+                    if let reset = bar.resetsAt {
+                        Text("· resets \(formatReset(reset, now: timeline.date))")
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.35))
+                    }
+                    Spacer()
+                    Text(displayValue)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.9))
                 }
-                Spacer()
-                Text(displayValue)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.9))
-            }
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.08))
-                    Capsule()
-                        .fill(barColor)
-                        .frame(width: geo.size.width * widthFraction)
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.white.opacity(0.08))
+                        Capsule()
+                            .fill(barColor)
+                            .frame(width: geo.size.width * widthFraction)
+                    }
                 }
+                .frame(height: 6)
             }
-            .frame(height: 6)
         }
     }
 
@@ -241,8 +230,8 @@ private struct BarView: View {
     }
 }
 
-private func formatReset(_ date: Date) -> String {
-    let seconds = Int(date.timeIntervalSinceNow)
+func formatReset(_ date: Date, now: Date = Date()) -> String {
+    let seconds = Int(date.timeIntervalSince(now))
     if seconds < 60 { return "now" }
     if seconds < 60 * 60 {
         let m = seconds / 60

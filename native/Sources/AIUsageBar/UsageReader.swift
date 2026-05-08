@@ -2,6 +2,8 @@ import Foundation
 
 private let fiveHours: TimeInterval = 5 * 60 * 60
 private let sevenDays: TimeInterval = 7 * 24 * 60 * 60
+private let claudeUsageRetryDelay: TimeInterval = 10 * 60
+private let claudeCachedPercentMaxAge: TimeInterval = 12 * 60 * 60
 
 private struct ModelPricing {
     let input: Double
@@ -96,24 +98,175 @@ actor ClaudeFileCache {
 // Remembers the last successful OAuth result for each provider so that a
 // transient 429 / network blip doesn't blow away a good display.
 actor OAuthSnapshotCache {
-    static let shared = OAuthSnapshotCache()
+    static let shared = OAuthSnapshotCache(storageURL: defaultStorageURL())
     private var lastGood: [ProviderUsage.ID: (usage: ProviderUsage, at: Date)] = [:]
+    private let storageURL: URL?
+    private var loadedFromDisk = false
+
+    init(storageURL: URL? = nil) {
+        self.storageURL = storageURL
+    }
 
     func store(_ usage: ProviderUsage) {
+        loadFromDiskIfNeeded()
         lastGood[usage.id] = (usage, Date())
+        saveToDisk()
     }
 
     func recent(_ id: ProviderUsage.ID, maxAge: TimeInterval) -> ProviderUsage? {
+        loadFromDiskIfNeeded()
         guard let entry = lastGood[id] else { return nil }
         if Date().timeIntervalSince(entry.at) > maxAge { return nil }
         return entry.usage
     }
+
+    private static func defaultStorageURL() -> URL? {
+        let manager = FileManager.default
+        let base = manager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? manager.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        return base
+            .appendingPathComponent("AIUsageBar", isDirectory: true)
+            .appendingPathComponent("oauth-snapshots.json")
+    }
+
+    private func loadFromDiskIfNeeded() {
+        guard !loadedFromDisk else { return }
+        loadedFromDisk = true
+        guard let storageURL,
+              let data = try? Data(contentsOf: storageURL),
+              let stored = try? JSONDecoder().decode(StoredOAuthSnapshots.self, from: data)
+        else { return }
+
+        for (rawID, entry) in stored.entries {
+            guard let id = ProviderUsage.ID(rawValue: rawID),
+                  let usage = entry.providerUsage(id: id)
+            else { continue }
+            lastGood[id] = (usage, entry.at)
+        }
+    }
+
+    private func saveToDisk() {
+        guard let storageURL else { return }
+        let entries = Dictionary(
+            uniqueKeysWithValues: lastGood.map { id, entry in
+                (id.rawValue, StoredOAuthSnapshotEntry(usage: entry.usage, at: entry.at))
+            }
+        )
+        let stored = StoredOAuthSnapshots(entries: entries)
+        guard let data = try? JSONEncoder().encode(stored) else { return }
+        do {
+            try FileManager.default.createDirectory(
+                at: storageURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try data.write(to: storageURL, options: [.atomic])
+        } catch {
+            // Cache persistence is best-effort; live reads and local fallback still work.
+        }
+    }
+}
+
+actor ClaudeUsageBackoff {
+    static let shared = ClaudeUsageBackoff(duration: claudeUsageRetryDelay)
+
+    private let duration: TimeInterval
+    private var blockedUntil: Date?
+
+    init(duration: TimeInterval) {
+        self.duration = duration
+    }
+
+    func canAttempt(now: Date = Date()) -> Bool {
+        guard let blockedUntil else { return true }
+        return now >= blockedUntil
+    }
+
+    func retryAfter(now: Date = Date()) -> TimeInterval? {
+        guard let blockedUntil else { return nil }
+        return max(0, blockedUntil.timeIntervalSince(now))
+    }
+
+    func recordRateLimit(now: Date = Date()) {
+        blockedUntil = now.addingTimeInterval(duration)
+    }
+
+    func reset() {
+        blockedUntil = nil
+    }
+}
+
+private struct StoredOAuthSnapshots: Codable {
+    let entries: [String: StoredOAuthSnapshotEntry]
+}
+
+private struct StoredOAuthSnapshotEntry: Codable {
+    let at: Date
+    let name: String
+    let status: String
+    let message: String?
+    let bars: [StoredUsageBar]
+    let meta: [StoredMetaItem]
+
+    init(usage: ProviderUsage, at: Date) {
+        self.at = at
+        name = usage.name
+        status = usage.status.rawValue
+        message = usage.message
+        bars = usage.bars.map(StoredUsageBar.init)
+        meta = usage.meta.map { StoredMetaItem(key: $0.0, value: $0.1) }
+    }
+
+    func providerUsage(id: ProviderUsage.ID) -> ProviderUsage? {
+        guard let status = ProviderStatus(rawValue: status) else { return nil }
+        return ProviderUsage(
+            id: id,
+            name: name,
+            status: status,
+            message: message,
+            bars: bars.map { $0.usageBar },
+            meta: meta.map { ($0.key, $0.value) }
+        )
+    }
+}
+
+private struct StoredUsageBar: Codable {
+    let label: String
+    let percent: Double?
+    let used: Double
+    let limit: Double?
+    let unit: String
+    let resetsAt: Date?
+
+    init(_ bar: UsageBar) {
+        label = bar.label
+        percent = bar.percent
+        used = bar.used
+        limit = bar.limit
+        unit = bar.unit
+        resetsAt = bar.resetsAt
+    }
+
+    var usageBar: UsageBar {
+        UsageBar(
+            label: label,
+            percent: percent,
+            used: used,
+            limit: limit,
+            unit: unit,
+            resetsAt: resetsAt
+        )
+    }
+}
+
+private struct StoredMetaItem: Codable {
+    let key: String
+    let value: String
 }
 
 enum UsageReader {
 
-    static func snapshot() async -> UsageSnapshot {
-        async let claude = readClaude()
+    static func snapshot(allowingCredentialPrompts: Bool = true) async -> UsageSnapshot {
+        async let claude = readClaude(allowingCredentialPrompts: allowingCredentialPrompts)
         async let codex = readCodex()
         let providers = await [claude, codex]
         return UsageSnapshot(fetchedAt: Date(), providers: providers)
@@ -121,38 +274,53 @@ enum UsageReader {
 
     // MARK: Claude
 
-    private static func readClaude() async -> ProviderUsage {
+    private static func readClaude(allowingCredentialPrompts: Bool) async -> ProviderUsage {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let claudeDir = home.appendingPathComponent(".claude", isDirectory: true)
         let claudeDirExists = FileManager.default.fileExists(atPath: claudeDir.path)
 
-        guard let credentials = try? KeychainReader.loadCredentials() else {
-            // No OAuth token available — offline-only fallback.
-            if !claudeDirExists {
-                return ProviderUsage(
-                    id: .claude, name: "Claude Code",
-                    status: .unavailable,
-                    message: "~/.claude not found — run Claude Code once.",
-                    bars: [], meta: []
-                )
+        let credentials: OAuthCredentials
+        do {
+            credentials = try await ClaudeCredentialCache.shared.credentials(
+                allowUserInteraction: allowingCredentialPrompts
+            ) { allowUserInteraction in
+                try KeychainReader.loadCredentials(allowUserInteraction: allowUserInteraction)
             }
-            return await claudeFromLocalScan(claudeDir: claudeDir)
+        } catch OAuthLoadError.interactionNotAllowed {
+            return await claudeWithoutOAuth(
+                claudeDir: claudeDir,
+                claudeDirExists: claudeDirExists,
+                message: "Claude keychain access needs approval — open the menu to allow once."
+            )
+        } catch {
+            // No OAuth token available — offline-only fallback.
+            return await claudeWithoutOAuth(
+                claudeDir: claudeDir,
+                claudeDirExists: claudeDirExists,
+                message: nil
+            )
+        }
+
+        if !(await ClaudeUsageBackoff.shared.canAttempt()) {
+            return await claudePercentageUnavailable(
+                credentials: credentials,
+                reason: "Claude usage percentage is rate-limited"
+            )
         }
 
         do {
             let resp = try await ClaudeOAuthClient.fetchUsage(accessToken: credentials.accessToken)
+            await ClaudeUsageBackoff.shared.reset()
             let usage = claudeFromOAuth(resp, credentials: credentials)
             await OAuthSnapshotCache.shared.store(usage)
             return usage
         } catch OAuthFetchError.unauthorized {
-            return ProviderUsage(
-                id: .claude, name: "Claude Code", status: .error,
-                message: "Token expired — run `claude` to re-auth.",
-                bars: [], meta: planMeta(credentials: credentials)
-            )
+            return await refreshClaudeCredentialsAndRetryUsage(credentials)
         } catch let OAuthFetchError.http(code) where code == 429 {
-            return await withRateLimitNote(
-                providerID: .claude, name: "Claude Code", credentials: credentials
+            await ClaudeUsageBackoff.shared.recordRateLimit()
+            return await claudePercentageUnavailable(
+                credentials: credentials,
+                reason: "Claude usage percentage is rate-limited"
             )
         } catch {
             return await withTransientNote(
@@ -162,24 +330,122 @@ enum UsageReader {
         }
     }
 
-    private static func withRateLimitNote(
-        providerID: ProviderUsage.ID,
-        name: String,
-        credentials: OAuthCredentials
+    private static func refreshClaudeCredentialsAndRetryUsage(
+        _ credentials: OAuthCredentials
     ) async -> ProviderUsage {
-        if var cached = await OAuthSnapshotCache.shared.recent(providerID, maxAge: 600) {
+        do {
+            let refreshed = try await ClaudeOAuthRefreshClient.refresh(credentials)
+            try? KeychainReader.saveCredentials(refreshed)
+            await ClaudeCredentialCache.shared.store(refreshed)
+
+            let resp = try await ClaudeOAuthClient.fetchUsage(accessToken: refreshed.accessToken)
+            await ClaudeUsageBackoff.shared.reset()
+            let usage = claudeFromOAuth(resp, credentials: refreshed)
+            await OAuthSnapshotCache.shared.store(usage)
+            return usage
+        } catch let OAuthFetchError.http(code) where code == 429 {
+            await ClaudeUsageBackoff.shared.recordRateLimit()
+            return await claudePercentageUnavailable(
+                credentials: credentials,
+                reason: "Claude usage percentage is rate-limited"
+            )
+        } catch let OAuthRefreshError.http(code) where code == 429 {
+            await ClaudeUsageBackoff.shared.recordRateLimit()
+            return await claudePercentageUnavailable(
+                credentials: credentials,
+                reason: "Claude token refresh is rate-limited"
+            )
+        } catch {
+            await ClaudeCredentialCache.shared.invalidate()
+            return ProviderUsage(
+                id: .claude, name: "Claude Code", status: .error,
+                message: "Claude token refresh failed — run `claude` to re-auth.",
+                bars: [], meta: planMeta(credentials: credentials)
+            )
+        }
+    }
+
+    private static func claudeWithoutOAuth(
+        claudeDir: URL,
+        claudeDirExists: Bool,
+        message: String?
+    ) async -> ProviderUsage {
+        if var cached = await recentClaudePercentageSnapshot(maxAge: claudeCachedPercentMaxAge) {
+            let fallbackMessage: String
+            if let message {
+                fallbackMessage = "\(message) Showing last good snapshot."
+            } else {
+                fallbackMessage = "Claude OAuth unavailable — showing cached percentage."
+            }
             cached = ProviderUsage(
-                id: cached.id, name: cached.name, status: .ok,
-                message: "Rate-limited — showing last good snapshot.",
+                id: cached.id, name: cached.name, status: .stale,
+                message: fallbackMessage,
                 bars: cached.bars, meta: cached.meta
             )
             return cached
         }
+
+        if !claudeDirExists {
+            return ProviderUsage(
+                id: .claude, name: "Claude Code",
+                status: .unavailable,
+                message: "~/.claude not found — run Claude Code once.",
+                bars: [], meta: []
+            )
+        }
+
+        if let message {
+            let local = await claudeFromLocalScan(claudeDir: claudeDir)
+            return ProviderUsage(
+                id: local.id, name: local.name, status: local.status,
+                message: message,
+                bars: local.bars, meta: local.meta
+            )
+        }
+
+        return await claudeFromLocalScan(claudeDir: claudeDir)
+    }
+
+    private static func claudePercentageUnavailable(
+        credentials: OAuthCredentials,
+        reason: String
+    ) async -> ProviderUsage {
+        let retry = await ClaudeUsageBackoff.shared.retryAfter()
+        let retryText = retry.map { " Retrying in \(formatDuration($0))." } ?? ""
+
+        if var cached = await recentClaudePercentageSnapshot(maxAge: claudeCachedPercentMaxAge) {
+            cached = ProviderUsage(
+                id: cached.id, name: cached.name, status: .stale,
+                message: "\(reason) — showing cached percentage.\(retryText)",
+                bars: cached.bars, meta: cached.meta
+            )
+            return cached
+        }
+
         return ProviderUsage(
-            id: providerID, name: name, status: .error,
-            message: "Rate-limited (HTTP 429). Retrying on next refresh.",
-            bars: [], meta: planMeta(credentials: credentials)
+            id: .claude,
+            name: "Claude Code",
+            status: .error,
+            message: "\(reason). Waiting for Anthropic usage API to return percent.\(retryText)",
+            bars: [],
+            meta: planMeta(credentials: credentials)
         )
+    }
+
+    private static func recentClaudePercentageSnapshot(maxAge: TimeInterval) async -> ProviderUsage? {
+        guard var cached = await OAuthSnapshotCache.shared.recent(.claude, maxAge: maxAge),
+              cached.bars.contains(where: { $0.percent != nil })
+        else { return nil }
+
+        cached = ProviderUsage(
+            id: cached.id,
+            name: cached.name,
+            status: .stale,
+            message: cached.message,
+            bars: cached.bars,
+            meta: cached.meta
+        )
+        return cached
     }
 
     private static func withTransientNote(
@@ -188,9 +454,19 @@ enum UsageReader {
         credentials: OAuthCredentials,
         error: Error
     ) async -> ProviderUsage {
+        if providerID == .claude,
+           var cached = await recentClaudePercentageSnapshot(maxAge: claudeCachedPercentMaxAge) {
+            cached = ProviderUsage(
+                id: cached.id, name: cached.name, status: .stale,
+                message: "Network error — showing cached percentage.",
+                bars: cached.bars, meta: cached.meta
+            )
+            return cached
+        }
+
         if var cached = await OAuthSnapshotCache.shared.recent(providerID, maxAge: 600) {
             cached = ProviderUsage(
-                id: cached.id, name: cached.name, status: .ok,
+                id: cached.id, name: cached.name, status: .stale,
                 message: "Network error — showing last good snapshot.",
                 bars: cached.bars, meta: cached.meta
             )
@@ -567,6 +843,14 @@ private func asDouble(_ v: Any?) -> Double {
     if let n = v as? NSNumber { return n.doubleValue }
     if let s = v as? String, let d = Double(s) { return d }
     return 0
+}
+
+private func formatDuration(_ seconds: TimeInterval) -> String {
+    let total = max(0, Int(ceil(seconds)))
+    if total < 60 { return "\(total)s" }
+    let minutes = total / 60
+    let remainder = total % 60
+    return remainder == 0 ? "\(minutes)m" : "\(minutes)m \(remainder)s"
 }
 
 private let iso8601Fractional: ISO8601DateFormatter = {

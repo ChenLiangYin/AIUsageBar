@@ -10,12 +10,15 @@ APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 CONTENTS="$APP_BUNDLE/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES_DIR="$CONTENTS/Resources"
+MODULE_CACHE="$BUILD_DIR/ModuleCache"
 
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 TARGET="arm64-apple-macos13.0"
 
 SOURCES=(
     "Sources/AIUsageBar/AIUsageBarApp.swift"
+    "Sources/AIUsageBar/StatusItemVisuals.swift"
+    "Sources/AIUsageBar/StatusMenuBuilder.swift"
     "Sources/AIUsageBar/UsageModels.swift"
     "Sources/AIUsageBar/UsageReader.swift"
     "Sources/AIUsageBar/UsageStore.swift"
@@ -27,10 +30,11 @@ SOURCES=(
 )
 
 rm -rf "$APP_BUNDLE"
-mkdir -p "$MACOS" "$RESOURCES_DIR"
+mkdir -p "$MACOS" "$RESOURCES_DIR" "$MODULE_CACHE"
 
 echo "==> swiftc -> $MACOS/$APP_NAME"
 swiftc \
+    -module-cache-path "$MODULE_CACHE" \
     -sdk "$SDK" \
     -target "$TARGET" \
     -O \
@@ -38,6 +42,7 @@ swiftc \
     -framework SwiftUI \
     -framework AppKit \
     -framework Foundation \
+    -framework LocalAuthentication \
     -o "$MACOS/$APP_NAME" \
     "${SOURCES[@]}"
 

@@ -13,7 +13,7 @@ later, Apple Silicon.
 ```bash
 cd native
 ./build.sh
-cp -R build/AIUsageBar.app ~/Applications/    # or /Applications/
+ditto build/AIUsageBar.app ~/Applications/AIUsageBar.app
 ```
 
 First launch is an ad-hoc-signed app, so macOS will say "unidentified
@@ -43,18 +43,20 @@ native/
 ├── Resources/Info.plist                 # LSUIElement=true (no Dock)
 ├── build.sh                             # swiftc compile + bundle + ad-hoc sign
 └── Sources/AIUsageBar/
-    ├── AIUsageBarApp.swift              # @main + NSStatusItem + NSPopover
-    ├── ContentView.swift                # SwiftUI popup
-    ├── UsageStore.swift                 # @MainActor store, 90s refresh loop
+    ├── AIUsageBarApp.swift              # @main + NSStatusItem + NSMenu
+    ├── ContentView.swift                # SwiftUI menu content
+    ├── StatusItemVisuals.swift          # menu bar icon/title setup
+    ├── StatusMenuBuilder.swift          # usage view + Quit menu item
+    ├── UsageStore.swift                 # @MainActor store, 10m refresh loop
     ├── UsageModels.swift                # ProviderUsage / UsageBar / UsageSnapshot
     ├── UsageReader.swift                # OAuth-first orchestration + snapshot cache
-    ├── ClaudeOAuth.swift                # Keychain read
-    ├── ClaudeOAuthClient.swift          # Claude /api/oauth/usage
+    ├── ClaudeOAuth.swift                # Keychain read/write + credential cache
+    ├── ClaudeOAuthClient.swift          # Claude usage + token refresh clients
     ├── CodexOAuth.swift                 # ~/.codex/auth.json read
     └── CodexOAuthClient.swift           # Codex /wham/usage
 ```
 
-Runtime footprint: ~28 MB RSS, 336 KB bundle, no third-party dependencies.
+Bundle footprint is roughly 628 KB after ad-hoc signing, with no third-party dependencies.
 
 ## Auto-start on login (optional)
 

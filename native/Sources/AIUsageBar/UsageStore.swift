@@ -8,14 +8,12 @@ final class UsageStore: ObservableObject {
 
     private var refreshLoop: Task<Void, Never>?
 
-    func start() {
+    func start(refreshIntervalNanoseconds: UInt64 = 600_000_000_000) {
         guard refreshLoop == nil else { return }
-        // 90s keeps us well under any sane rate limit while still feeling live.
-        let interval: UInt64 = 90_000_000_000
         refreshLoop = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.refresh()
-                try? await Task.sleep(nanoseconds: interval)
+                await self?.refresh(allowingCredentialPrompts: false)
+                try? await Task.sleep(nanoseconds: refreshIntervalNanoseconds)
             }
         }
     }
@@ -25,10 +23,11 @@ final class UsageStore: ObservableObject {
         refreshLoop = nil
     }
 
-    func refresh() async {
+    func refresh(allowingCredentialPrompts: Bool = true) async {
+        guard !refreshing else { return }
         refreshing = true
-        let snap = await UsageReader.snapshot()
+        defer { refreshing = false }
+        let snap = await UsageReader.snapshot(allowingCredentialPrompts: allowingCredentialPrompts)
         snapshot = snap
-        refreshing = false
     }
 }
