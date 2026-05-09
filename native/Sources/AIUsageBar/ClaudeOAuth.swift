@@ -2,6 +2,8 @@ import Foundation
 import LocalAuthentication
 import Security
 
+private let claudeCredentialCacheMaxAge: TimeInterval = 60
+
 struct OAuthCredentials: Sendable {
     let accessToken: String
     let refreshToken: String?
@@ -117,18 +119,33 @@ extension OAuthCredentials {
 actor ClaudeCredentialCache {
     static let shared = ClaudeCredentialCache()
 
-    private var cached: OAuthCredentials?
+    private var cached: (credentials: OAuthCredentials, loadedAt: Date)?
 
     func credentials(
         now: Date = Date(),
         allowUserInteraction: Bool,
         loader: (_ allowUserInteraction: Bool) throws -> OAuthCredentials
     ) throws -> OAuthCredentials {
-        if let cached, cached.isUsable(now: now) {
-            return cached
+        if let cached {
+            let usable = cached.credentials.isUsable(now: now)
+            let cacheAge = now.timeIntervalSince(cached.loadedAt)
+            if usable && cacheAge < claudeCredentialCacheMaxAge {
+                return cached.credentials
+            }
+
+            do {
+                let fresh = try loader(allowUserInteraction)
+                self.cached = (fresh, now)
+                return fresh
+            } catch {
+                if usable {
+                    return cached.credentials
+                }
+                throw error
+            }
         }
         let fresh = try loader(allowUserInteraction)
-        cached = fresh
+        cached = (fresh, now)
         return fresh
     }
 
@@ -137,6 +154,6 @@ actor ClaudeCredentialCache {
     }
 
     func store(_ credentials: OAuthCredentials) {
-        cached = credentials
+        cached = (credentials, Date())
     }
 }
