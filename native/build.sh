@@ -24,6 +24,7 @@ SOURCES=(
     "Sources/AIUsageBar/UsageStore.swift"
     "Sources/AIUsageBar/ContentView.swift"
     "Sources/AIUsageBar/ClaudeOAuth.swift"
+    "Sources/AIUsageBar/ClaudeSafeStorage.swift"
     "Sources/AIUsageBar/ClaudeOAuthClient.swift"
     "Sources/AIUsageBar/CodexOAuth.swift"
     "Sources/AIUsageBar/CodexOAuthClient.swift"

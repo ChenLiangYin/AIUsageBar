@@ -284,7 +284,7 @@ enum UsageReader {
             credentials = try await ClaudeCredentialCache.shared.credentials(
                 allowUserInteraction: allowingCredentialPrompts
             ) { allowUserInteraction in
-                try KeychainReader.loadCredentials(allowUserInteraction: allowUserInteraction)
+                try ClaudeCredentialReader.loadCredentials(allowUserInteraction: allowUserInteraction)
             }
         } catch OAuthLoadError.interactionNotAllowed {
             return await claudeWithoutOAuth(
@@ -417,7 +417,8 @@ enum UsageReader {
             cached = ProviderUsage(
                 id: cached.id, name: cached.name, status: .stale,
                 message: "\(reason) — showing cached percentage.\(retryText)",
-                bars: cached.bars, meta: cached.meta
+                bars: cached.bars,
+                meta: mergePlanMeta(cached.meta, credentials: credentials)
             )
             return cached
         }
@@ -459,7 +460,8 @@ enum UsageReader {
             cached = ProviderUsage(
                 id: cached.id, name: cached.name, status: .stale,
                 message: "Network error — showing cached percentage.",
-                bars: cached.bars, meta: cached.meta
+                bars: cached.bars,
+                meta: mergePlanMeta(cached.meta, credentials: credentials)
             )
             return cached
         }
@@ -540,6 +542,36 @@ enum UsageReader {
         }
         if let tier = credentials.rateLimitTier {
             out.append(("tier", tier))
+        }
+        return out
+    }
+
+    private static func mergePlanMeta(
+        _ meta: [(String, String)],
+        credentials: OAuthCredentials
+    ) -> [(String, String)] {
+        let latest = planMeta(credentials: credentials)
+        guard !latest.isEmpty else { return meta }
+
+        var values: [String: String] = [:]
+        for item in meta {
+            values[item.0] = item.1
+        }
+        for item in latest {
+            values[item.0] = item.1
+        }
+
+        var out: [(String, String)] = []
+        for key in ["plan", "tier", "7d budget"] {
+            if let value = values[key] {
+                out.append((key, value))
+            }
+        }
+        for item in meta where !out.contains(where: { $0.0 == item.0 }) {
+            out.append(item)
+        }
+        for item in latest where !out.contains(where: { $0.0 == item.0 }) {
+            out.append(item)
         }
         return out
     }
